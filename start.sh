@@ -1,2 +1,2 @@
 #!/bin/sh
-uv run webui.sh
+uv run webui.py
