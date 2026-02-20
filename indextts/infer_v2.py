@@ -193,9 +193,102 @@ class IndexTTS2:
         self.cache_emo_audio_prompt = None
         self.cache_mel = None
 
+        self.voice_dir = os.path.join(os.getcwd(), "voices")
+        os.makedirs(self.voice_dir, exist_ok=True)
+        self.voice_profiles = {}
+
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
+
+    def _sanitize_voice_name(self, voice_name: str):
+        voice_name = (voice_name or "").strip()
+        voice_name = re.sub(r"[\\/\\0]", "_", voice_name)
+        voice_name = re.sub(r"\s+", " ", voice_name)
+        voice_name = re.sub(r"[^0-9A-Za-z_\-\.\u4e00-\u9fff ]+", "_", voice_name)
+        voice_name = voice_name.strip(" ._")
+        return voice_name or "voice"
+
+    def _voice_profile_path(self, voice_name: str):
+        voice_name = self._sanitize_voice_name(voice_name)
+        return os.path.join(self.voice_dir, f"{voice_name}.pt")
+
+    def list_voices(self):
+        if not os.path.isdir(self.voice_dir):
+            return []
+        voices = []
+        for fn in os.listdir(self.voice_dir):
+            if fn.endswith(".pt"):
+                voices.append(os.path.splitext(fn)[0])
+        voices.sort()
+        return voices
+
+    def _extract_voice_features(self, audio_path: str, verbose=False):
+        audio, sr = self._load_and_cut_audio(audio_path, 15, verbose)
+        audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+        audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+        ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+        feat = torchaudio.compliance.kaldi.fbank(
+            audio_16k.to(ref_mel.device),
+            num_mel_bins=80,
+            dither=0,
+            sample_frequency=16000,
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        style = self.campplus_model(feat.unsqueeze(0))
+        prompt_condition = self.s2mel.models['length_regulator'](
+            S_ref,
+            ylens=ref_target_lengths,
+            n_quantizers=3,
+            f0=None,
+        )[0]
+
+        payload = {
+            "spk_cond_emb": spk_cond_emb.detach().cpu(),
+            "s2mel_style": style.detach().cpu(),
+            "s2mel_prompt": prompt_condition.detach().cpu(),
+            "mel": ref_mel.detach().cpu(),
+        }
+        return payload
+
+    def clone_voice(self, audio_path: str, voice_name: str = None, overwrite: bool = False, verbose: bool = False):
+        if voice_name is None:
+            base = os.path.basename(audio_path)
+            voice_name = os.path.splitext(base)[0]
+        voice_name = self._sanitize_voice_name(voice_name)
+        profile_path = self._voice_profile_path(voice_name)
+        if os.path.exists(profile_path) and not overwrite:
+            return voice_name
+        payload = self._extract_voice_features(audio_path, verbose=verbose)
+        payload["voice_name"] = voice_name
+        payload["created_at"] = time.time()
+        torch.save(payload, profile_path)
+        self.voice_profiles[voice_name] = payload
+        return voice_name
+
+    def load_voice(self, voice_name: str):
+        voice_name = self._sanitize_voice_name(voice_name)
+        if voice_name in self.voice_profiles:
+            return self.voice_profiles[voice_name]
+        profile_path = self._voice_profile_path(voice_name)
+        payload = torch.load(profile_path, map_location="cpu")
+        self.voice_profiles[voice_name] = payload
+        return payload
+
+    def _voice_payload_to_device(self, payload: dict):
+        spk_cond_emb = payload["spk_cond_emb"].to(self.device)
+        style = payload["s2mel_style"].to(self.device)
+        prompt_condition = payload["s2mel_prompt"].to(self.device)
+        ref_mel = payload["mel"].to(self.device)
+        return spk_cond_emb, style, prompt_condition, ref_mel
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
@@ -407,50 +500,62 @@ class IndexTTS2:
             # must always use alpha=1.0 when we don't have an external reference voice
             emo_alpha = 1.0
 
-        # 如果参考音频改变了，才需要重新生成, 提升速度
-        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
-            if self.cache_spk_cond is not None:
-                self.cache_spk_cond = None
-                self.cache_s2mel_style = None
-                self.cache_s2mel_prompt = None
-                self.cache_mel = None
-                torch.cuda.empty_cache()
-            audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
-            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
-
-            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-            input_features = inputs["input_features"]
-            attention_mask = inputs["attention_mask"]
-            input_features = input_features.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            spk_cond_emb = self.get_emb(input_features, attention_mask)
-
-            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                     num_mel_bins=80,
-                                                     dither=0,
-                                                     sample_frequency=16000)
-            feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-            style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
-
-            prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                     ylens=ref_target_lengths,
-                                                                     n_quantizers=3,
-                                                                     f0=None)[0]
-
+        if isinstance(spk_audio_prompt, dict) and "spk_cond_emb" in spk_audio_prompt:
+            spk_cond_emb, style, prompt_condition, ref_mel = self._voice_payload_to_device(spk_audio_prompt)
             self.cache_spk_cond = spk_cond_emb
             self.cache_s2mel_style = style
             self.cache_s2mel_prompt = prompt_condition
-            self.cache_spk_audio_prompt = spk_audio_prompt
+            self.cache_spk_audio_prompt = ("voice", spk_audio_prompt.get("voice_name"))
             self.cache_mel = ref_mel
         else:
-            style = self.cache_s2mel_style
-            prompt_condition = self.cache_s2mel_prompt
-            spk_cond_emb = self.cache_spk_cond
-            ref_mel = self.cache_mel
+            # 如果参考音频改变了，才需要重新生成, 提升速度
+            if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+                if self.cache_spk_cond is not None:
+                    self.cache_spk_cond = None
+                    self.cache_s2mel_style = None
+                    self.cache_s2mel_prompt = None
+                    self.cache_mel = None
+                    torch.cuda.empty_cache()
+                audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
+                audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+                audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+                inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+                input_features = inputs["input_features"]
+                attention_mask = inputs["attention_mask"]
+                input_features = input_features.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+                _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+                ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+                feat = torchaudio.compliance.kaldi.fbank(
+                    audio_16k.to(ref_mel.device),
+                    num_mel_bins=80,
+                    dither=0,
+                    sample_frequency=16000,
+                )
+                feat = feat - feat.mean(dim=0, keepdim=True)
+                style = self.campplus_model(feat.unsqueeze(0))
+
+                prompt_condition = self.s2mel.models['length_regulator'](
+                    S_ref,
+                    ylens=ref_target_lengths,
+                    n_quantizers=3,
+                    f0=None,
+                )[0]
+
+                self.cache_spk_cond = spk_cond_emb
+                self.cache_s2mel_style = style
+                self.cache_s2mel_prompt = prompt_condition
+                self.cache_spk_audio_prompt = spk_audio_prompt
+                self.cache_mel = ref_mel
+            else:
+                style = self.cache_s2mel_style
+                prompt_condition = self.cache_s2mel_prompt
+                spk_cond_emb = self.cache_spk_cond
+                ref_mel = self.cache_mel
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector).to(self.device)
@@ -465,22 +570,27 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-            if self.cache_emo_cond is not None:
-                self.cache_emo_cond = None
-                torch.cuda.empty_cache()
-            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-
+        if isinstance(emo_audio_prompt, dict) and "spk_cond_emb" in emo_audio_prompt:
+            emo_cond_emb = spk_cond_emb
             self.cache_emo_cond = emo_cond_emb
-            self.cache_emo_audio_prompt = emo_audio_prompt
+            self.cache_emo_audio_prompt = ("voice", emo_audio_prompt.get("voice_name"))
         else:
-            emo_cond_emb = self.cache_emo_cond
+            if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+                if self.cache_emo_cond is not None:
+                    self.cache_emo_cond = None
+                    torch.cuda.empty_cache()
+                emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+                emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"]
+                emo_attention_mask = emo_inputs["attention_mask"]
+                emo_input_features = emo_input_features.to(self.device)
+                emo_attention_mask = emo_attention_mask.to(self.device)
+                emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+
+                self.cache_emo_cond = emo_cond_emb
+                self.cache_emo_audio_prompt = emo_audio_prompt
+            else:
+                emo_cond_emb = self.cache_emo_cond
 
         self._set_gr_progress(0.1, "text processing...")
         text_tokens_list = self.tokenizer.tokenize(text)

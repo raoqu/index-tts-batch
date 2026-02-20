@@ -150,8 +150,9 @@ def main():
 	parser.add_argument('--range', dest='range', help='IDs to process. Examples: "3-10", "3", "3,5,7", or mixed like "1-3,7-9"')
 	args = parser.parse_args()
 
+	allowed_ids = None
 	if args.input_file is not None:
-		allowed_ids = parse_id_range(args.range) if args.range else None
+		allowed_ids = parse_id_range(args.range) if args.range else allowed_ids
 		print(f"处理文件: {args.input_file}", f"{allowed_ids}")
 		process_jsonl_with_curl(args.input_file, allowed_ids)
 	else:

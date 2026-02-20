@@ -11,6 +11,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import pandas as pd
+import torchaudio
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -162,6 +163,102 @@ def gen_single(emo_control_method,prompt, text,
                        **kwargs)
     return gr.update(value=output,visible=True)
 
+def gen_single_with_voice(emo_control_method, voice_name, prompt_fallback, text,
+               emo_ref_path, emo_weight,
+               vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+               emo_text, emo_random,
+               max_text_tokens_per_segment=120,
+                *args, progress=gr.Progress()):
+    output_path = None
+    if not output_path:
+        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+    tts.gr_progress = progress
+    do_sample, top_p, top_k, temperature, \
+        length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
+    kwargs = {
+        "do_sample": bool(do_sample),
+        "top_p": float(top_p),
+        "top_k": int(top_k) if int(top_k) > 0 else None,
+        "temperature": float(temperature),
+        "length_penalty": float(length_penalty),
+        "num_beams": num_beams,
+        "repetition_penalty": float(repetition_penalty),
+        "max_mel_tokens": int(max_mel_tokens),
+    }
+    if type(emo_control_method) is not int:
+        emo_control_method = emo_control_method.value
+    if emo_control_method == 0:
+        emo_ref_path = None
+    if emo_control_method == 2:
+        vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+        vec = tts.normalize_emo_vec(vec, apply_bias=True)
+    else:
+        vec = None
+    if emo_text == "":
+        emo_text = None
+
+    spk = None
+    if voice_name and voice_name != "-":
+        try:
+            spk = tts.load_voice(voice_name)
+        except Exception:
+            spk = None
+    if spk is None:
+        spk = prompt_fallback
+
+    tm_start = time.perf_counter()
+    output = tts.infer(
+        spk_audio_prompt=spk,
+        text=text,
+        output_path=output_path,
+        emo_audio_prompt=emo_ref_path,
+        emo_alpha=emo_weight,
+        emo_vector=vec,
+        use_emo_text=(emo_control_method==3),
+        emo_text=emo_text,
+        use_random=emo_random,
+        verbose=cmd_args.verbose,
+        max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+        **kwargs,
+    )
+
+    tm_end = time.perf_counter()
+    elapsed_s = tm_end - tm_start
+    duration_s = None
+    try:
+        if isinstance(output, str) and os.path.exists(output):
+            info = torchaudio.info(output)
+            if info.sample_rate and info.num_frames:
+                duration_s = float(info.num_frames) / float(info.sample_rate)
+    except Exception:
+        duration_s = None
+
+    if duration_s and duration_s > 0:
+        rtf = elapsed_s / duration_s
+        stats = f"Synthesize: {elapsed_s:.2f}s | Duration: {duration_s:.2f}s | RTF: {rtf:.3f}"
+    else:
+        stats = f"Synthesize: {elapsed_s:.2f}s | Duration: -"
+
+    return gr.update(value=output, visible=True), gr.update(value=stats)
+
+def clone_voice_from_prompt(prompt_audio_path, voice_name, overwrite=False):
+    if not prompt_audio_path:
+        return gr.update(), gr.update(), gr.update(interactive=True)
+    if voice_name is None or str(voice_name).strip() == "":
+        voice_name = os.path.splitext(os.path.basename(prompt_audio_path))[0]
+    saved_name = tts.clone_voice(prompt_audio_path, voice_name=voice_name, overwrite=overwrite, verbose=cmd_args.verbose)
+    choices = ["-"] + tts.list_voices()
+    return (
+        gr.update(choices=choices, value=saved_name),
+        gr.update(value=saved_name),
+        gr.update(interactive=True),
+    )
+
+def refresh_voices_dropdown(current_voice):
+    choices = ["-"] + tts.list_voices()
+    value = current_voice if current_voice in choices else "-"
+    return gr.update(choices=choices, value=value)
+
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
     return update_button
@@ -191,9 +288,16 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             if prompt_list:
                 default = prompt_list[0]
             with gr.Column():
+                voice_choices = ["-"] + tts.list_voices()
+                voice_name = gr.Textbox(label=i18n("音色名称"), value="", key="voice_name")
+                voice_dropdown = gr.Dropdown(label=i18n("已克隆音色"), choices=voice_choices, value="-", key="voice_dropdown")
+                with gr.Row():
+                    clone_button = gr.Button(i18n("克隆音色"), key="clone_button", interactive=True)
+                    refresh_voices = gr.Button(i18n("刷新音色列表"), key="refresh_voices", interactive=True)
                 input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
                 gen_button = gr.Button(i18n("生成语音"), key="gen_button",interactive=True)
             output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
+            synth_stats = gr.Textbox(label=i18n("合成统计"), value="", interactive=False, key="synth_stats")
 
         experimental_checkbox = gr.Checkbox(label=i18n("显示实验功能"), value=False)
 
@@ -426,14 +530,38 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                          inputs=[],
                          outputs=[gen_button])
 
-    gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, emo_upload, emo_weight,
+    prompt_audio.upload(
+        lambda p: gr.update(value=os.path.splitext(os.path.basename(p))[0]) if p else gr.update(),
+        inputs=[prompt_audio],
+        outputs=[voice_name],
+    )
+
+    clone_button.click(
+        clone_voice_from_prompt,
+        inputs=[prompt_audio, voice_name],
+        outputs=[voice_dropdown, voice_name, gen_button],
+    )
+
+    refresh_voices.click(
+        refresh_voices_dropdown,
+        inputs=[voice_dropdown],
+        outputs=[voice_dropdown],
+    )
+
+    demo.load(
+        refresh_voices_dropdown,
+        inputs=[voice_dropdown],
+        outputs=[voice_dropdown],
+    )
+
+    gen_button.click(gen_single_with_voice,
+                     inputs=[emo_control_method, voice_dropdown, prompt_audio, input_text_single, emo_upload, emo_weight,
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_segment,
                              *advanced_params,
                      ],
-                     outputs=[output_audio])
+                     outputs=[output_audio, synth_stats])
 
 
 

@@ -10,13 +10,13 @@ rm -f "$OUT_FILE" "$TMP_DIR"/*
 # 目标目录（可选参数），默认当前目录
 DIR="${1:-.}"
 
-# 获取所有 wav 文件，排除 input.wav
+# 获取所有 wav 文件，排除 input*.wav
 shopt -s nullglob
 files=( "$DIR"/*.wav )
 selected=()
 for f in "${files[@]}"; do
     base="$(basename "$f")"
-    if [ "$base" = "input.wav" ]; then
+    if [[ "$base" == input*.wav ]]; then
         continue
     fi
     # 记录为绝对路径，便于 ffmpeg concat
@@ -26,11 +26,11 @@ done
 total=${#selected[@]}
 
 if [ $total -eq 0 ]; then
-    echo "目录 '$DIR' 下没有可合并的 .wav 文件（已排除 input.wav）"
+    echo "目录 '$DIR' 下没有可合并的 .wav 文件（已排除 input*.wav）"
     exit 1
 fi
 
-echo "目录 '$DIR' 下共找到 $total 个 .wav 文件（已排除 input.wav）"
+echo "目录 '$DIR' 下共找到 $total 个 .wav 文件（已排除 input*.wav）"
 
 # 动态设定批次大小
 if [ $total -le 100 ]; then
