@@ -110,6 +110,55 @@ def get_example_cases(include_experimental = False):
     # exclude emotion control mode 3 (emotion from text description)
     return [x for x in example_cases if x[1] != EMO_CHOICES_ALL[3]]
 
+
+def get_example_cases_with_cloned_voices(include_experimental: bool = False):
+    samples = []
+
+    for ex in get_example_cases(include_experimental=include_experimental):
+        prompt_path = ex[0]
+        prompt_bn = os.path.basename(prompt_path) if isinstance(prompt_path, str) else str(prompt_path)
+        samples.append(
+            [
+                f"[E] {prompt_bn}",
+                "-",
+                ex[0],
+                ex[1],
+                ex[2],
+                ex[3],
+                ex[4],
+                ex[5],
+                ex[6], ex[7], ex[8], ex[9], ex[10], ex[11], ex[12], ex[13],
+            ]
+        )
+
+    for v in tts.list_voices():
+        ref_audio = None
+        try:
+            ref_audio = tts.get_voice_ref_audio(v)
+        except Exception:
+            ref_audio = None
+        if not ref_audio:
+            try:
+                tts.delete_voice(v)
+            except Exception:
+                pass
+            continue
+        samples.append(
+            [
+                f"[C] {v}",
+                v,
+                ref_audio,
+                EMO_CHOICES_ALL[0],
+                "",
+                None,
+                0.65,
+                "",
+                0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        )
+
+    return samples
+
 def gen_single(emo_control_method,prompt, text,
                emo_ref_path, emo_weight,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
@@ -243,21 +292,23 @@ def gen_single_with_voice(emo_control_method, voice_name, prompt_fallback, text,
 
 def clone_voice_from_prompt(prompt_audio_path, voice_name, overwrite=False):
     if not prompt_audio_path:
-        return gr.update(), gr.update(), gr.update(interactive=True)
+        return None
     if voice_name is None or str(voice_name).strip() == "":
         voice_name = os.path.splitext(os.path.basename(prompt_audio_path))[0]
     saved_name = tts.clone_voice(prompt_audio_path, voice_name=voice_name, overwrite=overwrite, verbose=cmd_args.verbose)
-    choices = ["-"] + tts.list_voices()
-    return (
-        gr.update(choices=choices, value=saved_name),
-        gr.update(value=saved_name),
-        gr.update(interactive=True),
-    )
+    return saved_name
 
-def refresh_voices_dropdown(current_voice):
-    choices = ["-"] + tts.list_voices()
-    value = current_voice if current_voice in choices else "-"
-    return gr.update(choices=choices, value=value)
+
+def clone_voice_api(prompt_audio_path, voice_name=None):
+    if not prompt_audio_path:
+        raise ValueError("prompt_audio_path is required")
+    if voice_name is None or str(voice_name).strip() == "":
+        voice_name = os.path.splitext(os.path.basename(str(prompt_audio_path)))[0]
+    saved_name = tts.clone_voice(str(prompt_audio_path), voice_name=str(voice_name), overwrite=False, verbose=cmd_args.verbose)
+    return saved_name
+
+def refresh_examples_table(is_experimental: bool = False):
+    return gr.update(samples=get_example_cases_with_cloned_voices(include_experimental=is_experimental))
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -283,17 +334,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             os.makedirs("prompts",exist_ok=True)
             prompt_audio = gr.Audio(label=i18n("音色参考音频"),key="prompt_audio",
                                     sources=["upload","microphone"],type="filepath")
+            selected_voice = gr.Textbox(label=i18n("已选择音色"), value="-", visible=False, key="selected_voice")
             prompt_list = os.listdir("prompts")
             default = ''
             if prompt_list:
                 default = prompt_list[0]
             with gr.Column():
-                voice_choices = ["-"] + tts.list_voices()
-                voice_name = gr.Textbox(label=i18n("音色名称"), value="", key="voice_name")
-                voice_dropdown = gr.Dropdown(label=i18n("已克隆音色"), choices=voice_choices, value="-", key="voice_dropdown")
-                with gr.Row():
-                    clone_button = gr.Button(i18n("克隆音色"), key="clone_button", interactive=True)
-                    refresh_voices = gr.Button(i18n("刷新音色列表"), key="refresh_voices", interactive=True)
                 input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
                 gen_button = gr.Button(i18n("生成语音"), key="gen_button",interactive=True)
             output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
@@ -391,14 +437,17 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         # we must use `gr.Dataset` to support dynamic UI rewrites, since `gr.Examples`
         # binds tightly to UI and always restores the initial state of all components,
         # such as the list of available choices in emo_control_method.
+        example_voice_source = gr.Textbox(label=i18n("音色"), visible=False)
         example_table = gr.Dataset(label="Examples",
             samples_per_page=20,
-            samples=get_example_cases(include_experimental=False),
+            samples=get_example_cases_with_cloned_voices(include_experimental=False),
             type="values",
             # these components are NOT "connected". it just reads the column labels/available
             # states from them, so we MUST link to the "all options" versions of all components,
             # such as `emo_control_method_all` (to be able to see EXPERIMENTAL text labels)!
-            components=[prompt_audio,
+            components=[example_voice_source,
+                        selected_voice,
+                        prompt_audio,
                         emo_control_method_all,  # important: support all mode labels!
                         input_text_single,
                         emo_upload,
@@ -409,10 +458,34 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     def on_example_click(example):
         print(f"Example clicked: ({len(example)} values) = {example!r}")
+        voice_source = example[0]
+        voice_value = example[1]
+        prompt_value = example[2]
+
+        if isinstance(voice_source, str) and voice_source.startswith("[C]"):
+            # cloned voice: set selected voice and its reference audio, do NOT overwrite the rest.
+            return (
+                gr.update(value=voice_value),
+                gr.update(value=prompt_value),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
+
+        # example prompt: reset selected voice so prompt_audio is actually used.
         return (
-            gr.update(value=example[0]),
-            gr.update(value=example[1]),
-            gr.update(value=example[2]),
+            gr.update(value="-"),
+            gr.update(value=prompt_value),
             gr.update(value=example[3]),
             gr.update(value=example[4]),
             gr.update(value=example[5]),
@@ -424,12 +497,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gr.update(value=example[11]),
             gr.update(value=example[12]),
             gr.update(value=example[13]),
+            gr.update(value=example[14]),
+            gr.update(value=example[15]),
         )
 
     # click() event works on both desktop and mobile UI
     example_table.click(on_example_click,
                         inputs=[example_table],
-                        outputs=[prompt_audio,
+                        outputs=[selected_voice,
+                                 prompt_audio,
                                  emo_control_method,
                                  input_text_single,
                                  emo_upload,
@@ -505,7 +581,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
         return (
             gr.update(choices=new_choices, value=new_choices[new_index]),
-            gr.update(samples=get_example_cases(include_experimental=is_experimental)),
+            gr.update(samples=get_example_cases_with_cloned_voices(include_experimental=is_experimental)),
         )
 
     experimental_checkbox.change(
@@ -526,42 +602,84 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=[segments_preview]
     )
 
-    prompt_audio.upload(update_prompt_audio,
-                         inputs=[],
-                         outputs=[gen_button])
+    demo.load(
+        refresh_examples_table,
+        inputs=[experimental_checkbox],
+        outputs=[example_table],
+    )
+
+    def on_prompt_audio_uploaded(p):
+        if p:
+            return gr.update(value="-"), gr.update(interactive=True)
+        return gr.update(), gr.update(interactive=True)
 
     prompt_audio.upload(
-        lambda p: gr.update(value=os.path.splitext(os.path.basename(p))[0]) if p else gr.update(),
+        on_prompt_audio_uploaded,
         inputs=[prompt_audio],
-        outputs=[voice_name],
-    )
-
-    clone_button.click(
-        clone_voice_from_prompt,
-        inputs=[prompt_audio, voice_name],
-        outputs=[voice_dropdown, voice_name, gen_button],
-    )
-
-    refresh_voices.click(
-        refresh_voices_dropdown,
-        inputs=[voice_dropdown],
-        outputs=[voice_dropdown],
-    )
-
-    demo.load(
-        refresh_voices_dropdown,
-        inputs=[voice_dropdown],
-        outputs=[voice_dropdown],
+        outputs=[selected_voice, gen_button],
     )
 
     gen_button.click(gen_single_with_voice,
-                     inputs=[emo_control_method, voice_dropdown, prompt_audio, input_text_single, emo_upload, emo_weight,
+                     inputs=[emo_control_method, selected_voice, prompt_audio, input_text_single, emo_upload, emo_weight,
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_segment,
                              *advanced_params,
                      ],
                      outputs=[output_audio, synth_stats])
+
+    with gr.Tab(i18n("音色克隆管理")):
+        with gr.Row():
+            clone_prompt_audio = gr.Audio(label=i18n("音色参考音频"), key="clone_prompt_audio",
+                                          sources=["upload", "microphone"], type="filepath")
+            with gr.Column():
+                voice_name = gr.Textbox(label=i18n("音色名称"), value="", key="voice_name")
+                with gr.Row():
+                    clone_button = gr.Button(i18n("克隆音色"), key="clone_button", interactive=True)
+                    refresh_voices = gr.Button(i18n("刷新音色列表"), key="refresh_voices", interactive=True)
+
+        clone_api_result = gr.Textbox(label=i18n("克隆结果"), visible=False, interactive=False, key="clone_api_result")
+        clone_api_button = gr.Button(i18n("克隆音色(API)"), visible=False, interactive=True, key="clone_api_button")
+
+        clone_prompt_audio.upload(
+            lambda p: gr.update(value=os.path.splitext(os.path.basename(p))[0]) if p else gr.update(),
+            inputs=[clone_prompt_audio],
+            outputs=[voice_name],
+        )
+
+        def on_clone_click(p, n, is_exp):
+            saved_name = clone_voice_from_prompt(p, n)
+            if not saved_name or not isinstance(saved_name, str):
+                return gr.update(), gr.update(), refresh_examples_table(is_experimental=is_exp)
+            ref = None
+            try:
+                ref = tts.get_voice_ref_audio(saved_name)
+            except Exception:
+                ref = None
+            return (
+                gr.update(value=saved_name),
+                gr.update(value=saved_name),
+                refresh_examples_table(is_experimental=is_exp),
+            )
+
+        clone_button.click(
+            on_clone_click,
+            inputs=[clone_prompt_audio, voice_name, experimental_checkbox],
+            outputs=[voice_name, selected_voice, example_table],
+        )
+
+        clone_api_button.click(
+            clone_voice_api,
+            inputs=[clone_prompt_audio, voice_name],
+            outputs=[clone_api_result],
+            api_name="/clone_voice",
+        )
+
+        refresh_voices.click(
+            refresh_examples_table,
+            inputs=[experimental_checkbox],
+            outputs=[example_table],
+        )
 
 
 

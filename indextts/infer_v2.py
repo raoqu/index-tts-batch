@@ -5,6 +5,7 @@ os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
 import json
 import re
 import time
+import shutil
 import librosa
 import torch
 import torchaudio
@@ -195,6 +196,8 @@ class IndexTTS2:
 
         self.voice_dir = os.path.join(os.getcwd(), "voices")
         os.makedirs(self.voice_dir, exist_ok=True)
+        self.voice_ref_dir = os.path.join(self.voice_dir, "refs")
+        os.makedirs(self.voice_ref_dir, exist_ok=True)
         self.voice_profiles = {}
 
         # 进度引用显示（可选）
@@ -212,6 +215,13 @@ class IndexTTS2:
     def _voice_profile_path(self, voice_name: str):
         voice_name = self._sanitize_voice_name(voice_name)
         return os.path.join(self.voice_dir, f"{voice_name}.pt")
+
+    def _voice_ref_audio_path(self, voice_name: str, ext: str = ".wav"):
+        voice_name = self._sanitize_voice_name(voice_name)
+        ext = (ext or ".wav").strip()
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        return os.path.join(self.voice_ref_dir, f"{voice_name}{ext}")
 
     def list_voices(self):
         if not os.path.isdir(self.voice_dir):
@@ -270,9 +280,59 @@ class IndexTTS2:
         payload = self._extract_voice_features(audio_path, verbose=verbose)
         payload["voice_name"] = voice_name
         payload["created_at"] = time.time()
+
+        ref_audio_path = None
+        try:
+            ext = os.path.splitext(audio_path)[1] or ".wav"
+            ref_audio_path = self._voice_ref_audio_path(voice_name, ext=ext)
+            os.makedirs(os.path.dirname(ref_audio_path), exist_ok=True)
+            shutil.copy2(audio_path, ref_audio_path)
+        except Exception:
+            ref_audio_path = None
+        payload["ref_audio_path"] = ref_audio_path
+
         torch.save(payload, profile_path)
         self.voice_profiles[voice_name] = payload
         return voice_name
+
+    def get_voice_ref_audio(self, voice_name: str):
+        try:
+            payload = self.load_voice(voice_name)
+        except Exception:
+            return None
+        ref = payload.get("ref_audio_path") if isinstance(payload, dict) else None
+        if not ref or not isinstance(ref, str) or not os.path.exists(ref):
+            return None
+        return ref
+
+    def delete_voice(self, voice_name: str):
+        voice_name = self._sanitize_voice_name(voice_name)
+        ref_path = None
+        try:
+            payload = self.voice_profiles.get(voice_name)
+            if payload is None:
+                profile_path = self._voice_profile_path(voice_name)
+                if os.path.exists(profile_path):
+                    payload = torch.load(profile_path, map_location="cpu")
+            if isinstance(payload, dict):
+                ref_path = payload.get("ref_audio_path")
+        except Exception:
+            ref_path = None
+
+        profile_path = self._voice_profile_path(voice_name)
+        try:
+            if os.path.exists(profile_path):
+                os.remove(profile_path)
+        except Exception:
+            pass
+
+        try:
+            if ref_path and isinstance(ref_path, str) and os.path.exists(ref_path):
+                os.remove(ref_path)
+        except Exception:
+            pass
+
+        self.voice_profiles.pop(voice_name, None)
 
     def load_voice(self, voice_name: str):
         voice_name = self._sanitize_voice_name(voice_name)
@@ -398,6 +458,13 @@ class IndexTTS2:
     def _set_gr_progress(self, value, desc):
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
+    
+    def _empty_device_cache(self):
+        # Clear accelerator-specific caches without assuming CUDA only
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     def _load_and_cut_audio(self,audio_path,max_audio_length_seconds,verbose=False,sr=None):
         if not sr:

@@ -5,6 +5,31 @@ import argparse
 from gradio_client import Client, handle_file
 import time
 
+
+def _extract_audio_path(result):
+	if result is None:
+		return None
+	if isinstance(result, (list, tuple)):
+		if len(result) == 0:
+			return None
+		return _extract_audio_path(result[0])
+	if isinstance(result, str):
+		return result
+	if isinstance(result, dict):
+		p = result.get("path")
+		if isinstance(p, str):
+			return p
+		for k in ("生成结果", "value", "audio", "output"):
+			v = result.get(k)
+			p2 = _extract_audio_path(v)
+			if isinstance(p2, str):
+				return p2
+		for v in result.values():
+			p3 = _extract_audio_path(v)
+			if isinstance(p3, str):
+				return p3
+	return None
+
 def Gen(text, output_path):
 	# replace text "\n" to "。"
 	text = text.replace("\n", "。").replace("一一", "——")
@@ -19,9 +44,9 @@ def Gen(text, output_path):
 	try:
 		client = Client("http://localhost:7860/")
 		result = client.predict(
-				output_path=output_path,
 				emo_control_method="与音色参考音频相同",
-				prompt=handle_file('./input.wav'),
+				voice_name="-",
+				prompt_fallback=handle_file('./input.wav'),
 				text=text,
 				emo_ref_path=handle_file('./input.wav'),
 				emo_weight=0.8,
@@ -36,20 +61,17 @@ def Gen(text, output_path):
 				emo_text="",
 				emo_random=False,
 				max_text_tokens_per_segment=120,
-				param_16=True,
-				param_17=0.8,
-				param_18=30,
-				param_19=0.8,
-				param_20=0,
-				param_21=3,
-				param_22=10,
-				param_23=1500,
-				api_name="/gen_single"
+				param_17=True,
+				param_18=0.8,
+				param_19=30,
+				param_20=0.8,
+				param_21=0,
+				param_22=3,
+				param_23=10,
+				param_24=1500,
+				api_name="/gen_single_with_voice"
 		)
-		if isinstance(result, dict) and 'value' in result:
-			output = result['value']
-		else:
-			output = None
+		output = _extract_audio_path(result)
 	except Exception as e:
 		print(f"生成音频失败: {show_text} -> {output_path}: {e}")
 		output = None
@@ -128,7 +150,7 @@ def process_jsonl_with_curl(input_file, allowed_ids=None):
 
 					# 3. 生成并保存音频
 					path = Gen(text_to_synthesize, output_filename)
-					if path is None:
+					if path is None or not isinstance(path, (str, bytes, os.PathLike)):
 						print(f" 生成音频失败: {text_to_synthesize[:30]}...")
 						continue
 					# move file path -> output_filename
