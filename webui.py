@@ -672,7 +672,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             clone_voice_api,
             inputs=[clone_prompt_audio, voice_name],
             outputs=[clone_api_result],
-            api_name="/clone_voice",
+            api_name="clone_voice",
         )
 
         refresh_voices.click(

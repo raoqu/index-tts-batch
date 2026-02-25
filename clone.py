@@ -23,11 +23,22 @@ def main():
 
     client = Client(args.host)
     try:
-        result = client.predict(
-            prompt_audio_path=handle_file(wav_path),
-            voice_name=voice_name,
-            api_name="/clone_voice",
-        )
+        try:
+            result = client.predict(
+                prompt_audio_path=handle_file(wav_path),
+                voice_name=voice_name,
+                api_name="/clone_voice",
+            )
+        except Exception as e1:
+            msg = str(e1)
+            if "Cannot find a function" in msg and "/clone_voice" in msg:
+                result = client.predict(
+                    prompt_audio_path=handle_file(wav_path),
+                    voice_name=voice_name,
+                    api_name="//clone_voice",
+                )
+            else:
+                raise
     except Exception as e:
         print(f"Error: clone failed: {e}", file=sys.stderr)
         sys.exit(1)
