@@ -528,6 +528,7 @@ class IndexTTS2:
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
         print(">> starting inference...")
+        print(text)
         self._set_gr_progress(0, "starting inference...")
         if verbose:
             print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt}, "
